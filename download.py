@@ -11,7 +11,13 @@ from functools import lru_cache
 MAX_RETRIES = 3
 RETRY_DELAY = 2
 MAX_CONCURRENT_WORKERS = 5
-DEFAULT_CONCURRENT_WORKERS = 3
+DEFAULT_CONCURRENT_WORKERS = 2
+
+
+def sanitize_filename(value: str) -> str:
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", value)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned.rstrip(". ")
 
 
 @lru_cache(maxsize=128)
@@ -141,7 +147,13 @@ def get_available_formats(url: str) -> None:
         print(f"Error listing formats: {str(error)}")
 
 
-def download_single_video(url: str, output_path: str, thread_id: int = 0, audio_only: bool = False) -> dict:
+def download_single_video(
+    url: str,
+    output_path: str,
+    thread_id: int = 0,
+    audio_only: bool = False,
+    custom_title: Optional[str] = None,
+) -> dict:
     """
     Download a single YouTube video, playlist, or channel with retry mechanism.
 
@@ -216,8 +228,17 @@ def download_single_video(url: str, output_path: str, thread_id: int = 0, audio_
         print(f"📺 [Thread {thread_id}] Detected channel URL. Downloading entire channel...")
         print(f"📁 [Thread {thread_id}] Files will be saved to: {output_path}/[channel_name]/")
     else:
-        downloader_options['outtmpl'] = os.path.join(
-            output_path, f'%(title)s.{file_extension}')
+        if custom_title:
+            safe_title = sanitize_filename(custom_title)
+            if safe_title:
+                downloader_options['outtmpl'] = os.path.join(
+                    output_path, f'{safe_title}.{file_extension}')
+            else:
+                downloader_options['outtmpl'] = os.path.join(
+                    output_path, f'%(title)s.{file_extension}')
+        else:
+            downloader_options['outtmpl'] = os.path.join(
+                output_path, f'%(title)s.{file_extension}')
         print(f"🎥 [Thread {thread_id}] Detected single video URL. Downloading {'audio' if audio_only else 'video'}...")
         print(f"📁 [Thread {thread_id}] File will be saved to: {output_path}/")
 
@@ -360,6 +381,91 @@ def download_youtube_content(urls: List[str], output_path: Optional[str] = None,
 
     print(f"✅ Successful downloads: {total_successful_count} {'files' if total_successful_count != 1 else 'file'}")
     print(f"❌ Failed downloads: {total_failed_count} {'files' if total_failed_count != 1 else 'file'}")
+
+    if failed_downloads:
+        print("\n❌ Failed URLs:")
+        for result in failed_downloads:
+            print(f"   • {result['url']}")
+            print(f"     Reason: {result['message']}")
+
+    if successful_downloads:
+        print(f"\n🎉 All files saved to: {output_path}")
+
+
+def download_urls_with_titles(
+    items: List[Tuple[str, str]],
+    output_path: Optional[str] = None,
+    max_workers: int = DEFAULT_CONCURRENT_WORKERS,
+    audio_only: bool = False,
+) -> None:
+    if output_path is None:
+        output_path = os.path.join(os.getcwd(), 'downloads')
+
+    if not items:
+        print("❌ No URLs to download.")
+        return
+
+    os.makedirs(output_path, exist_ok=True)
+
+    file_extension = 'mp3' if audio_only else 'mp4'
+    pending_items: List[Tuple[str, str]] = []
+    skipped_items: List[Tuple[str, str]] = []
+
+    for url, title in items:
+        safe_title = sanitize_filename(title)
+        expected_path = os.path.join(output_path, f"{safe_title}.{file_extension}")
+        if safe_title and os.path.exists(expected_path):
+            skipped_items.append((url, title))
+        else:
+            pending_items.append((url, title))
+
+    if skipped_items:
+        print(f"⏭️  Skipping {len(skipped_items)} item(s) already in downloads:")
+        for _, title in skipped_items:
+            print(f"   • {title}")
+
+    if not pending_items:
+        print("\n✅ Nothing to download. All titles already exist.")
+        return
+
+    print(
+        f"\n🚀 Starting download of {len(pending_items)} URL(s) with {max_workers} concurrent workers...")
+    print(f"📁 Output directory: {output_path}")
+    print(f"🎧 Format: {'MP3 Audio Only' if audio_only else 'MP4 Video'}")
+    print("-" * 60)
+
+    results = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_url = {
+            executor.submit(
+                download_single_video,
+                url,
+                output_path,
+                i + 1,
+                audio_only,
+                title,
+            ): url
+            for i, (url, title) in enumerate(pending_items)
+        }
+
+        for future in as_completed(future_to_url):
+            result = future.result()
+            results.append(result)
+            print(result['message'])
+
+    print("\n" + "=" * 60)
+    print("📊 DOWNLOAD SUMMARY")
+    print("=" * 60)
+
+    successful_downloads = [r for r in results if r['success']]
+    failed_downloads = [r for r in results if not r['success']]
+
+    total_successful_count = sum(r.get('count', 1) for r in successful_downloads)
+    total_failed_count = sum(r.get('count', 1) for r in failed_downloads)
+
+    print(f"✅ Successful downloads: {total_successful_count} {'files' if total_successful_count != 1 else 'file'}")
+    print(f"❌ Failed downloads: {total_failed_count} {'files' if total_failed_count != 1 else 'file'}")
+    print(f"⏭️  Skipped (already exists): {len(skipped_items)} file(s)")
 
     if failed_downloads:
         print("\n❌ Failed URLs:")
